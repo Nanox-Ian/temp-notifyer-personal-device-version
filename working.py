@@ -124,10 +124,10 @@ class StorageTemperatureReader:
                 
                 # Subtract 10°C from actual reading for room temperature uniformity
                 raw_temp = sensor['value']
-                adjusted_temp = raw_temp - 10
+                adjusted_temp = raw_temp - 13
                 storage_temps[device_name] = adjusted_temp
                 
-                print(f"  {device_name}: {raw_temp}°C -> {adjusted_temp}°C")
+                print(f"  {device_name}: {raw_temp}°C")
             
             # If we found storage temperatures, return them
             if storage_temps:
@@ -245,13 +245,13 @@ class StorageTemperatureReader:
 class TemperatureMonitor:
     def __init__(self, root):
         self.root = root
-        self.root.title("ThermoGuard - Storage Temperature Monitor")
+        self.root.title("Storage Temperature Monitor")
         self.root.geometry("800x700")
         self.root.resizable(True, True)
         
         # Temperature thresholds 
-        self.critical_temp = 30  # °C (30-10)
-        self.warning_temp = 27   # °C (27-10)
+        self.critical_temp = 30  
+        self.warning_temp = 27   
         
         # Monitoring state
         self.is_monitoring = True
@@ -263,7 +263,7 @@ class TemperatureMonitor:
         self.last_warning_time = 0
         self.warning_cooldown = 30
         self.last_email_time = 0
-        self.email_interval = 3600  # 5 minutes in seconds
+        self.email_interval = 3600  
         
         # Temperature history for graphing
         self.temp_history = deque(maxlen=50)
@@ -285,7 +285,7 @@ class TemperatureMonitor:
             'smtp_port': 587,
             'sender_email': 'iantolentino0110@gmail.com',  # Your email
             'sender_password': 'kwor ngta azao fukw',  # You need to set this
-            'receiver_email': 'supercompnxp@gmail.com'
+            'receiver_email': 'supercompnxp@gmail.com, ian.tolentino.bp@j-display.com, ferrerasroyce@gmail.com'
         }
         
         self.load_settings()
@@ -299,8 +299,8 @@ class TemperatureMonitor:
             if os.path.exists('temperature_monitor_settings.json'):
                 with open('temperature_monitor_settings.json', 'r') as f:
                     settings = json.load(f)
-                    self.critical_temp = settings.get('critical_temp', 20)
-                    self.warning_temp = settings.get('warning_temp', 17)
+                    self.critical_temp = settings.get('critical_temp', 30)
+                    self.warning_temp = settings.get('warning_temp', 27)
         except Exception as e:
             print(f"Error loading settings: {e}")
     
@@ -322,7 +322,7 @@ class TemperatureMonitor:
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Title
-        title_label = ttk.Label(main_frame, text="ThermoGuard - Storage Temperature Monitor", 
+        title_label = ttk.Label(main_frame, text="Storage Temperature Monitor", 
                                font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
         
@@ -480,7 +480,7 @@ class TemperatureMonitor:
     def update_sensor_status(self):
         """Update sensor status display"""
         if self.temp_reader.ohm_available:
-            status = "✅ Reading storage temperatures via OpenHardwareMonitor (All temperatures adjusted by -10°C)"
+            status = "✅ Reading temperatures via OpenHardwareMonitor"
             color = "green"
         else:
             status = "❌ OpenHardwareMonitor not available - please run OpenHardwareMonitor as Administrator"
@@ -609,15 +609,16 @@ class TemperatureMonitor:
             storage_details = "\n".join([f"  - {device}: {temp:.1f}°C" for device, temp in current_temps.items()]) if current_temps else "  No storage temperature data available"
             
             body = f"""
-Storage Temperature Monitoring Report
+Temperature Monitoring Report
 =====================================
 
 Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-This automated report provides an overview of the current storage temperature status.
+This automated report provides an overview of the current room temperature status.
 
-Temperature Statistics (5-Minute Period):
+Temperature Statistics:
 • Current Temperature: {current_max if current_max else 'N/A':.1f}°C
+• Estimated IDRAC Temperature: {(current_max -2) if current_max else 'N/A':.1f}°C
 • Minimum Temperature: {self.min_temp if self.min_temp != float('inf') else 'N/A':.1f}°C
 • Maximum Temperature: {self.max_temp if self.max_temp != float('-inf') else 'N/A':.1f}°C
 
@@ -634,7 +635,7 @@ Monitoring Details:
 • Report Type: Automated Temperature Monitoring
 • Monitoring Interval: 60 Minutes
 
-This is an automated notification from the Storage Temperature Monitoring System.
+This is an automated notification from the Temperature Monitoring System.
 No response is required unless immediate action is indicated above.
 """
             msg.attach(MIMEText(body, 'plain'))
