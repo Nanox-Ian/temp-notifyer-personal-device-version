@@ -43,7 +43,6 @@ last_temperature = None
 last_status = "UNKNOWN"
 temperature_history = []
 last_email_sent = {}
-last_regular_report_sent = None
 
 def setup_logging():
     logging.basicConfig(
@@ -114,7 +113,7 @@ class IDRACMonitor:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    logging.info(f"Redfish response from {endpoint}")
+                    logging.info(f"Redfish response from {endpoint}: {json.dumps(data)[:500]}...")
                     
                     # Parse different Redfish structures
                     temp = self._parse_redfish_data(data)
@@ -129,29 +128,36 @@ class IDRACMonitor:
     
     def _parse_redfish_data(self, data):
         """Parse temperature from various Redfish structures - WITH -60°C ADJUSTMENT"""
+        logging.info(f"Parsing Redfish data structure...")
+        
         # Method 1: Look for Temperatures array (most common)
         if 'Temperatures' in data:
+            logging.info("Found Temperatures array, searching for valid temperature readings...")
             for sensor in data['Temperatures']:
                 sensor_name = sensor.get('Name', 'Unknown')
                 reading_c = sensor.get('ReadingCelsius')
                 reading_raw = sensor.get('Reading')
                 
+                logging.info(f"Sensor: {sensor_name}, ReadingCelsius: {reading_c}, Reading: {reading_raw}")
+                
                 # Prefer ReadingCelsius if available
                 if reading_c is not None:
                     # Apply -60°C adjustment and validate it's a reasonable temperature
                     adjusted_temp = reading_c - 60
-                    if 0 <= adjusted_temp <= 100:
+                    if 0 <= adjusted_temp <= 100:  # Reasonable server temperature range
                         logging.info(f"Using adjusted ReadingCelsius: {reading_c}°C -> {adjusted_temp}°C from sensor: {sensor_name}")
                         return adjusted_temp
                 
                 # Fallback to Reading field
                 if reading_raw is not None:
+                    # Check if it's a temperature value (not RPM, voltage, etc.)
                     if isinstance(reading_raw, (int, float)):
                         adjusted_temp = reading_raw - 60
                         if 0 <= adjusted_temp <= 100:
                             logging.info(f"Using adjusted Reading: {reading_raw}°C -> {adjusted_temp}°C from sensor: {sensor_name}")
                             return adjusted_temp
                     elif isinstance(reading_raw, str):
+                        # Extract numeric value from string
                         match = re.search(r'(\d+)', str(reading_raw))
                         if match:
                             temp = int(match.group(1))
@@ -160,8 +166,38 @@ class IDRACMonitor:
                                 logging.info(f"Using adjusted parsed Reading: {temp}°C -> {adjusted_temp}°C from sensor: {sensor_name}")
                                 return adjusted_temp
         
+        # Method 2: Look for Readings array
+        if 'Readings' in data:
+            logging.info("Found Readings array, searching for temperature values...")
+            for reading in data['Readings']:
+                reading_value = reading.get('Reading')
+                reading_name = reading.get('Name', 'Unknown')
+                
+                logging.info(f"Reading: {reading_name}, Value: {reading_value}")
+                
+                if reading_value is not None:
+                    if isinstance(reading_value, (int, float)):
+                        adjusted_temp = reading_value - 60
+                        if 0 <= adjusted_temp <= 100:
+                            logging.info(f"Using adjusted Reading value: {reading_value}°C -> {adjusted_temp}°C from {reading_name}")
+                            return adjusted_temp
+        
+        # Method 3: Look for ambient/inlet temperature specifically
+        if 'Temperatures' in data:
+            ambient_sensors = ['Ambient', 'Inlet', 'System Board Inlet', 'Inlet Temp']
+            for sensor in data['Temperatures']:
+                sensor_name = sensor.get('Name', '')
+                reading_c = sensor.get('ReadingCelsius')
+                
+                if any(ambient in sensor_name for ambient in ambient_sensors) and reading_c is not None:
+                    adjusted_temp = reading_c - 60
+                    if 0 <= adjusted_temp <= 100:
+                        logging.info(f"Using adjusted ambient temperature: {reading_c}°C -> {adjusted_temp}°C from {sensor_name}")
+                        return adjusted_temp
+        
+        logging.warning("No valid temperature found in Redfish data")
         return None
-    
+
     def _try_legacy_api(self):
         """Try legacy iDRAC API endpoints"""
         endpoints = [
@@ -181,24 +217,24 @@ class IDRACMonitor:
                     # Try JSON parsing
                     try:
                         data = response.json()
+                        logging.info(f"Legacy API JSON response: {json.dumps(data)[:500]}...")
+                        
                         if 'tempReading' in data:
-                            temp = data['tempReading'] - 60  # Apply adjustment
-                            if 0 <= temp <= 100:
-                                return temp, self._get_temperature_status(temp)
+                            return data['tempReading'], self._get_temperature_status(data['tempReading'])
                         if 'thermalReading' in data:
-                            temp = data['thermalReading'] - 60  # Apply adjustment
-                            if 0 <= temp <= 100:
-                                return temp, self._get_temperature_status(temp)
+                            return data['thermalReading'], self._get_temperature_status(data['thermalReading'])
                     except:
                         # Try text parsing
                         text = response.text
+                        logging.info(f"Legacy API text response: {text[:500]}...")
+                        
+                        # Look for temperature patterns
                         temp = self._extract_temperature_from_text(text)
                         if temp is not None:
-                            adjusted_temp = temp - 60  # Apply adjustment
-                            if 0 <= adjusted_temp <= 100:
-                                return adjusted_temp, self._get_temperature_status(adjusted_temp)
+                            return temp, self._get_temperature_status(temp)
                             
             except Exception as e:
+                logging.warning(f"Legacy endpoint {endpoint} failed: {str(e)}")
                 continue
                 
         return None, "Legacy API unavailable"
@@ -221,14 +257,29 @@ class IDRACMonitor:
                     text = response.text
                     temp = self._extract_temperature_from_text(text)
                     if temp is not None:
-                        adjusted_temp = temp - 60  # Apply adjustment
-                        if 0 <= adjusted_temp <= 100:
-                            return adjusted_temp, self._get_temperature_status(adjusted_temp)
+                        return temp, self._get_temperature_status(temp)
                         
             except Exception as e:
                 continue
                 
         return None, "Sensor API unavailable"
+    
+    def debug_redfish_response(self, endpoint):
+        """Get full Redfish response for debugging"""
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = self.session.get(url, auth=(self.username, self.password), timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                logging.info(f"=== FULL REDFISH RESPONSE FROM {endpoint} ===")
+                logging.info(json.dumps(data, indent=2))
+                logging.info("=== END REDFISH RESPONSE ===")
+                return data
+            else:
+                logging.error(f"Redfish debug request failed with status: {response.status_code}")
+        except Exception as e:
+            logging.error(f"Redfish debug failed: {str(e)}")
     
     def _try_html_parsing(self):
         """Try parsing temperature from HTML pages"""
@@ -247,12 +298,12 @@ class IDRACMonitor:
                 
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Look for temperature in page text
                     text = soup.get_text()
                     temp = self._extract_temperature_from_text(text)
                     if temp is not None:
-                        adjusted_temp = temp - 60  # Apply adjustment
-                        if 0 <= adjusted_temp <= 100:
-                            return adjusted_temp, self._get_temperature_status(adjusted_temp)
+                        return temp, self._get_temperature_status(temp)
                         
             except Exception as e:
                 continue
@@ -276,7 +327,7 @@ class IDRACMonitor:
                 for match in matches:
                     try:
                         temp = int(match)
-                        if 0 <= temp <= 100:
+                        if 0 <= temp <= 100:  # Reasonable temperature range
                             return temp
                     except ValueError:
                         continue
@@ -298,9 +349,7 @@ class EmailSender:
         try:
             if is_test:
                 subject = "TEST: iDRAC Temperature Monitoring System"
-                # Get current temperature for test email
-                current_temp, current_status = monitor.get_temperature()
-                body = EmailSender._create_test_email_body(current_temp, current_status)
+                body = EmailSender._create_test_email_body()
             else:
                 if email_type == "warning":
                     subject = f"WARNING: High Temperature Alert - {temperature}°C"
@@ -308,8 +357,6 @@ class EmailSender:
                     subject = f"CRITICAL: Immediate Action Required - {temperature}°C"
                 elif email_type == "regular":
                     subject = f"Regular Temperature Report - {temperature}°C"
-                elif email_type == "manual":
-                    subject = f"Manual Temperature Report - {temperature}°C"
                 else:
                     subject = f"Temperature Monitoring Report - {status}"
                 
@@ -324,11 +371,11 @@ class EmailSender:
                 server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
                 server.sendmail(Config.SENDER_EMAIL, Config.RECEIVER_EMAIL, message)
             
-            logging.info(f"✅ Email sent successfully - Type: {email_type}, Temperature: {temperature}°C, Status: {status}")
+            logging.info(f"Email sent - Type: {email_type}, Temp: {temperature}°C, Status: {status}")
             return True
             
         except Exception as e:
-            logging.error(f"❌ Email sending failed: {str(e)}")
+            logging.error(f"Email sending failed: {str(e)}")
             return False
     
     @staticmethod
@@ -365,38 +412,28 @@ Monitoring Details:
 This is an automated notification."""
     
     @staticmethod
-    def _create_test_email_body(current_temp, current_status):
-        """Create email body for test email with current temperature"""
+    def _create_test_email_body():
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        return f"""✅ TEST EMAIL - iDRAC Temperature Monitoring System
+        return f"""IDRAC Temperature Monitoring System
 
-This is a test email to verify the monitoring system is working correctly.
+This automated report provides an overview of the current temperature of  {Config.IDRAC_URL}.
 
-If you received this email, the system is operational and can send alerts.
+Status Overview:
+Latest IDRAC Temperature: {last_temperature}
+Latest Status: {last_status}
 
-CURRENT SYSTEM STATUS:
-• Current Temperature: {current_temp}°C
-• Current Status: {current_status}
-• Alert Type: TEST
+Monitoring Details: 
+Timestamp: {timestamp}
+iDRAC URL SOURCE: {Config.IDRAC_URL}
 
-THRESHOLDS:
-• Warning Threshold: {Config.WARNING_THRESHOLD}°C
-• Critical Threshold: {Config.CRITICAL_THRESHOLD}°C
-
-System Configuration:
-• iDRAC URL: {Config.IDRAC_URL}
-• Monitoring Interval: {Config.CHECK_INTERVAL_MINUTES} minutes
-• Last Check: {timestamp}
-
-This is an automated test message. No action required."""
+System is operational."""
 
 # Global instances
 monitor = IDRACMonitor()
 email_sender = EmailSender()
 
-def should_send_alert_email(status, email_type):
-    """Determine if we should send an alert email"""
+def should_send_email(status, email_type):
+    """Determine if we should send an email"""
     global last_email_sent
     
     if email_type == "test":
@@ -406,6 +443,8 @@ def should_send_alert_email(status, email_type):
     if status == "WARNING" and not Config.SEND_WARNING_EMAILS:
         return False
     if status == "CRITICAL" and not Config.SEND_CRITICAL_EMAILS:
+        return False
+    if email_type == "regular" and not Config.SEND_REGULAR_REPORTS:
         return False
     
     # Anti-spam cooldown
@@ -417,26 +456,6 @@ def should_send_alert_email(status, email_type):
     
     last_email_sent[email_type] = now
     return True
-
-def should_send_regular_report():
-    """Determine if we should send a regular report"""
-    global last_regular_report_sent
-    
-    if not Config.SEND_REGULAR_REPORTS:
-        return False
-    
-    now = datetime.now()
-    
-    if last_regular_report_sent is None:
-        last_regular_report_sent = now
-        return True
-    
-    time_since_last = now - last_regular_report_sent
-    if time_since_last >= timedelta(minutes=Config.CHECK_INTERVAL_MINUTES):
-        last_regular_report_sent = now
-        return True
-    
-    return False
 
 def check_temperature_and_notify():
     """Check temperature and send notifications"""
@@ -463,19 +482,19 @@ def check_temperature_and_notify():
             
             logging.info(f"Temperature: {temperature}°C, Status: {status}")
             
-            # Send alert emails based on status
-            if status == "CRITICAL" and should_send_alert_email(status, "critical"):
-                if email_sender.send_email(temperature, status, email_type="critical"):
-                    logging.info("✅ Critical alert email sent")
+            # Send appropriate emails
+            if status == "CRITICAL" and should_send_email(status, "critical"):
+                email_sender.send_email(temperature, status, email_type="critical")
+                logging.info("Critical alert sent")
             
-            elif status == "WARNING" and should_send_alert_email(status, "warning"):
-                if email_sender.send_email(temperature, status, email_type="warning"):
-                    logging.info("✅ Warning alert email sent")
+            elif status == "WARNING" and should_send_email(status, "warning"):
+                email_sender.send_email(temperature, status, email_type="warning")
+                logging.info("Warning alert sent")
             
-            # Send regular report
-            if should_send_regular_report():
-                if email_sender.send_email(temperature, status, email_type="regular"):
-                    logging.info("✅ Regular report email sent")
+            # Regular report every 60 minutes
+            elif Config.SEND_REGULAR_REPORTS and should_send_email(status, "regular"):
+                email_sender.send_email(temperature, status, email_type="regular")
+                logging.info("Regular report sent")
             
             return temperature, status
         else:
@@ -494,8 +513,6 @@ def scheduled_monitoring():
 # Initialize scheduler
 scheduler = BackgroundScheduler()
 
-# ========== ALL API ENDPOINTS ==========
-
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -513,6 +530,24 @@ def api_get_temperature():
         'message': 'Temperature retrieved successfully' if temperature else status
     })
 
+@app.route('/api/debug-redfish', methods=['GET'])
+def api_debug_redfish():
+    """Debug endpoint to see full Redfish response"""
+    endpoint = request.args.get('endpoint', '/redfish/v1/Chassis/System.Embedded.1/Thermal')
+    data = monitor.debug_redfish_response(endpoint)
+    
+    if data:
+        return jsonify({
+            'success': True,
+            'endpoint': endpoint,
+            'data': data
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'message': 'Failed to get Redfish data'
+        })
+
 @app.route('/api/send-test-email', methods=['POST'])
 def api_send_test_email():
     """API endpoint to send test email"""
@@ -520,59 +555,6 @@ def api_send_test_email():
     return jsonify({
         'success': success,
         'message': 'Test email sent successfully' if success else 'Failed to send test email'
-    })
-
-@app.route('/api/send-report', methods=['POST'])
-def api_send_report():
-    """API endpoint to send manual temperature report"""
-    try:
-        # First, get the current temperature to ensure we have fresh data
-        temperature, status = check_temperature_and_notify()
-        
-        if temperature is None:
-            # If we can't get current temperature, try to use the last one
-            if last_temperature is None:
-                return jsonify({
-                    'success': False,
-                    'message': 'No temperature data available. Please check iDRAC connection.'
-                })
-            else:
-                temperature = last_temperature
-                status = last_status
-                logging.info(f"Using last known temperature for manual report: {temperature}°C")
-        
-        success = email_sender.send_email(temperature, status, email_type="manual")
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'message': f'Manual report sent successfully! Temperature: {temperature}°C, Status: {status}'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'message': 'Failed to send manual report email. Check email configuration.'
-            })
-            
-    except Exception as e:
-        logging.error(f"Manual report error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': f'Error sending manual report: {str(e)}'
-        })
-
-@app.route('/api/history', methods=['GET'])
-def api_get_history():
-    """API endpoint to get temperature history"""
-    return jsonify({
-        'history': [
-            {
-                'timestamp': reading['timestamp'].isoformat(),
-                'temperature': reading['temperature'],
-                'status': reading['status']
-            }
-            for reading in temperature_history[-24:]  # Last 24 readings
-        ]
     })
 
 @app.route('/api/status', methods=['GET'])
@@ -583,69 +565,8 @@ def api_get_status():
         'last_status': last_status,
         'last_check': temperature_history[-1]['timestamp'].isoformat() if temperature_history else None,
         'monitoring_active': scheduler.running,
-        'check_interval': Config.CHECK_INTERVAL_MINUTES,
-        'email_settings': {
-            'send_warning_emails': Config.SEND_WARNING_EMAILS,
-            'send_critical_emails': Config.SEND_CRITICAL_EMAILS,
-            'send_regular_reports': Config.SEND_REGULAR_REPORTS
-        }
+        'check_interval': Config.CHECK_INTERVAL_MINUTES
     })
-
-@app.route('/api/test-email-connection', methods=['POST'])
-def api_test_email_connection():
-    """Test email connection and sending"""
-    try:
-        # Test SMTP connection
-        with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
-            server.starttls()
-            server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
-        
-        return jsonify({
-            'success': True,
-            'message': 'SMTP connection successful'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'SMTP connection failed: {str(e)}'
-        })
-
-@app.route('/api/settings', methods=['POST'])
-def api_update_settings():
-    """API endpoint to update monitoring settings"""
-    try:
-        data = request.get_json()
-        
-        if 'send_warning_emails' in data:
-            Config.SEND_WARNING_EMAILS = bool(data['send_warning_emails'])
-        if 'send_critical_emails' in data:
-            Config.SEND_CRITICAL_EMAILS = bool(data['send_critical_emails'])
-        if 'send_regular_reports' in data:
-            Config.SEND_REGULAR_REPORTS = bool(data['send_regular_reports'])
-        if 'check_interval' in data:
-            Config.CHECK_INTERVAL_MINUTES = int(data['check_interval'])
-            
-        # Restart scheduler with new interval
-        if scheduler.running:
-            scheduler.remove_job('temperature_monitoring')
-            scheduler.add_job(
-                func=scheduled_monitoring,
-                trigger="interval",
-                minutes=Config.CHECK_INTERVAL_MINUTES,
-                id='temperature_monitoring'
-            )
-        
-        return jsonify({
-            'success': True,
-            'message': 'Settings updated successfully'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error updating settings: {str(e)}'
-        })
 
 if __name__ == '__main__':
     setup_logging()
