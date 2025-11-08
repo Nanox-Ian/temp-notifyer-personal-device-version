@@ -24,8 +24,8 @@ class Config:
     # SMTP Configuration
     SMTP_SERVER = "smtp.gmail.com"
     SMTP_PORT = 587
-    SENDER_EMAIL = "iantolentino0110@gmail.com"
-    SENDER_PASSWORD = "pbry vaoq jwoz pyyp"
+    SENDER_EMAIL = "nxpisian@gmail.com"
+    SENDER_PASSWORD = "aqkz uykr cmfu oqbm"
     RECEIVER_EMAIL = "supercompnxp@gmail.com"
     
     # Monitoring Configuration
@@ -43,6 +43,8 @@ last_temperature = None
 last_status = "UNKNOWN"
 temperature_history = []
 last_email_sent = {}
+next_email_delay = 5  # Custom delay for next email in minutes
+scheduled_email_job = None  # Reference to scheduled email job
 
 def setup_logging():
     logging.basicConfig(
@@ -143,7 +145,7 @@ class IDRACMonitor:
                 # Prefer ReadingCelsius if available
                 if reading_c is not None:
                     # Apply -60°C adjustment and validate it's a reasonable temperature
-                    adjusted_temp = reading_c - 60
+                    adjusted_temp = reading_c - 62
                     if 0 <= adjusted_temp <= 100:  # Reasonable server temperature range
                         logging.info(f"Using adjusted ReadingCelsius: {reading_c}°C -> {adjusted_temp}°C from sensor: {sensor_name}")
                         return adjusted_temp
@@ -348,9 +350,10 @@ class EmailSender:
         """Send email with temperature information"""
         try:
             if is_test:
-                subject = "TEST: iDRAC Temperature Monitoring System"
+                subject = "iDRAC Temperature Monitoring System"
                 body = EmailSender._create_test_email_body()
             else:
+                # Use test email format for all email types but include temperature data
                 if email_type == "warning":
                     subject = f"WARNING: High Temperature Alert - {temperature}°C"
                 elif email_type == "critical":
@@ -360,7 +363,7 @@ class EmailSender:
                 else:
                     subject = f"Temperature Monitoring Report - {status}"
                 
-                body = EmailSender._create_email_body(temperature, status, email_type)
+                body = EmailSender._create_full_report_body(temperature, status, email_type)
             
             # Create email manually
             message = f"Subject: {subject}\n\n{body}"
@@ -379,37 +382,57 @@ class EmailSender:
             return False
     
     @staticmethod
-    def _create_email_body(temperature, status, email_type):
+    def _create_full_report_body(temperature, status, email_type):
+        """Create full report body using the test email format but with actual data"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         if email_type == "warning":
-            recommendations = "• Monitor temperature closely\n• Check cooling systems\n• Ensure proper ventilation"
+            alert_note = "⚠️ WARNING: Temperature above normal threshold"
         elif email_type == "critical":
-            recommendations = "• IMMEDIATE ACTION REQUIRED\n• Check server cooling\n• Contact IT support"
+            alert_note = "🚨 CRITICAL: Temperature requires immediate attention"
         else:
-            recommendations = "• System operating normally\n• Continue regular monitoring"
+            alert_note = "✅ System operating normally"
         
-        return f"""Temperature Monitoring Report
-=====================================
+        # Use the test email format but with actual temperature data
+        return f"""IDRAC Temperature Monitoring System
 
-Timestamp: {timestamp}
+This automated report provides an overview of the current temperature of {Config.IDRAC_URL}.
 
-Temperature: {temperature}°C
-Status: {status}
-Alert Type: {email_type.upper()}
+{alert_note}
 
-Thresholds:
-• Warning: {Config.WARNING_THRESHOLD}°C
-• Critical: {Config.CRITICAL_THRESHOLD}°C
+Status Overview:
+Latest IDRAC Temperature: {temperature}°C
+Latest Status: {status}
 
-Recommended Actions:
-{recommendations}
+Threshold Information:
+• Warning Level: {Config.WARNING_THRESHOLD}°C
+• Critical Level: {Config.CRITICAL_THRESHOLD}°C
 
 Monitoring Details:
-• iDRAC URL: {Config.IDRAC_URL}
-• Monitoring Interval: {Config.CHECK_INTERVAL_MINUTES} Minutes
+Timestamp: {timestamp}
+iDRAC URL SOURCE: {Config.IDRAC_URL}
+Check Interval: {Config.CHECK_INTERVAL_MINUTES} minutes
 
-This is an automated notification."""
+Temperature History (Last 5 readings):
+{EmailSender._get_temperature_history_text()}
+
+System is operational and monitoring continues."""
+
+    @staticmethod
+    def _get_temperature_history_text():
+        """Get formatted temperature history"""
+        if not temperature_history:
+            return "No history available"
+        
+        history_text = ""
+        recent_history = temperature_history[-5:]  # Last 5 readings
+        for entry in recent_history:
+            timestamp = entry['timestamp'].strftime("%H:%M:%S")
+            temp = entry['temperature']
+            status = entry['status']
+            history_text += f"• {timestamp}: {temp}°C ({status})\n"
+        
+        return history_text
     
     @staticmethod
     def _create_test_email_body():
@@ -482,7 +505,7 @@ def check_temperature_and_notify():
             
             logging.info(f"Temperature: {temperature}°C, Status: {status}")
             
-            # Send appropriate emails
+            # Send appropriate emails using the new full report format
             if status == "CRITICAL" and should_send_email(status, "critical"):
                 email_sender.send_email(temperature, status, email_type="critical")
                 logging.info("Critical alert sent")
@@ -504,6 +527,67 @@ def check_temperature_and_notify():
     except Exception as e:
         logging.error(f"Temperature check error: {str(e)}")
         return None, str(e)
+
+def send_immediate_full_report():
+    """Send an immediate full report using the test email format"""
+    global last_temperature, last_status
+    
+    try:
+        # Get current temperature first
+        temperature, status = check_temperature_and_notify()
+        
+        if temperature is None:
+            # Use last known values if current reading fails
+            temperature = last_temperature
+            status = last_status
+        
+        if temperature is not None:
+            success = email_sender.send_email(temperature, status, email_type="regular")
+            if success:
+                logging.info("Immediate full report sent successfully")
+                return True
+            else:
+                logging.error("Failed to send immediate full report")
+                return False
+        else:
+            logging.error("No temperature data available for full report")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error sending immediate full report: {str(e)}")
+        return False
+
+def schedule_next_email(delay_minutes):
+    """Schedule the next email to be sent after specified delay"""
+    global scheduled_email_job, next_email_delay
+    
+    try:
+        # Validate delay
+        if delay_minutes < 5 or delay_minutes > 60:
+            return False, "Delay must be between 5 and 60 minutes"
+        
+        # Remove existing scheduled job if any
+        if scheduled_email_job:
+            scheduler.remove_job(scheduled_email_job.id)
+        
+        # Schedule new job
+        run_time = datetime.now() + timedelta(minutes=delay_minutes)
+        job = scheduler.add_job(
+            func=send_immediate_full_report,
+            trigger="date",
+            run_date=run_time,
+            id=f'scheduled_email_{run_time.strftime("%Y%m%d%H%M%S")}'
+        )
+        
+        scheduled_email_job = job
+        next_email_delay = delay_minutes
+        
+        logging.info(f"Next email scheduled in {delay_minutes} minutes at {run_time}")
+        return True, f"Next email scheduled in {delay_minutes} minutes"
+        
+    except Exception as e:
+        logging.error(f"Error scheduling next email: {str(e)}")
+        return False, str(e)
 
 def scheduled_monitoring():
     """Scheduled monitoring task"""
@@ -557,6 +641,58 @@ def api_send_test_email():
         'message': 'Test email sent successfully' if success else 'Failed to send test email'
     })
 
+@app.route('/api/send-full-report', methods=['POST'])
+def api_send_full_report():
+    """API endpoint to send immediate full report"""
+    success = send_immediate_full_report()
+    return jsonify({
+        'success': success,
+        'message': 'Full report sent successfully' if success else 'Failed to send full report'
+    })
+
+@app.route('/api/schedule-next-email', methods=['POST'])
+def api_schedule_next_email():
+    """API endpoint to schedule next email with custom delay"""
+    data = request.get_json()
+    
+    if not data or 'delay_minutes' not in data:
+        return jsonify({
+            'success': False,
+            'message': 'delay_minutes parameter is required'
+        })
+    
+    delay_minutes = data['delay_minutes']
+    
+    try:
+        delay_minutes = int(delay_minutes)
+    except ValueError:
+        return jsonify({
+            'success': False,
+            'message': 'delay_minutes must be a number'
+        })
+    
+    success, message = schedule_next_email(delay_minutes)
+    
+    return jsonify({
+        'success': success,
+        'message': message
+    })
+
+@app.route('/api/schedule-status', methods=['GET'])
+def api_schedule_status():
+    """API endpoint to get scheduling status"""
+    status = {
+        'next_email_scheduled': scheduled_email_job is not None,
+        'next_email_delay': next_email_delay,
+        'next_run_time': scheduled_email_job.next_run_time.isoformat() if scheduled_email_job else None,
+        'monitoring_interval': Config.CHECK_INTERVAL_MINUTES
+    }
+    
+    return jsonify({
+        'success': True,
+        'status': status
+    })
+
 @app.route('/api/status', methods=['GET'])
 def api_get_status():
     """API endpoint to get system status"""
@@ -565,7 +701,8 @@ def api_get_status():
         'last_status': last_status,
         'last_check': temperature_history[-1]['timestamp'].isoformat() if temperature_history else None,
         'monitoring_active': scheduler.running,
-        'check_interval': Config.CHECK_INTERVAL_MINUTES
+        'check_interval': Config.CHECK_INTERVAL_MINUTES,
+        'temperature_history_count': len(temperature_history)
     })
 
 if __name__ == '__main__':
